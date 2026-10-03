@@ -1,0 +1,1518 @@
+import cv2
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+import pyautogui
+import ctypes
+
+# Native Windows mouse-wheel event.
+# One WHEEL_DELTA is one standard mouse-wheel notch.
+MOUSEEVENTF_WHEEL = 0x0800
+WHEEL_DELTA = 120
+
+# ============================================================
+# NATIVE WINDOWS INPUT ENGINE
+# ============================================================
+# PyAutoGUI is intentionally not used for SCROLL/ZOOM input.
+# Windows SendInput gives us low-latency native wheel + keyboard events.
+INPUT_MOUSE = 0
+INPUT_KEYBOARD = 1
+
+KEYEVENTF_KEYUP = 0x0002
+
+VK_CONTROL = 0x11
+VK_SHIFT = 0x10
+VK_OEM_PLUS = 0xBB
+VK_OEM_MINUS = 0xBD
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", ctypes.c_long),
+        ("dy", ctypes.c_long),
+        ("mouseData", ctypes.c_ulong),
+        ("dwFlags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", ctypes.c_ushort),
+        ("wScan", ctypes.c_ushort),
+        ("dwFlags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+class INPUT_UNION(ctypes.Union):
+    _fields_ = [
+        ("mi", MOUSEINPUT),
+        ("ki", KEYBDINPUT),
+    ]
+
+class INPUT(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = [
+        ("type", ctypes.c_ulong),
+        ("u", INPUT_UNION),
+    ]
+
+_user32 = ctypes.windll.user32
+
+def native_mouse_wheel(notches: int):
+    if notches == 0:
+        return
+    inp = INPUT()
+    inp.type = INPUT_MOUSE
+    inp.mi = MOUSEINPUT(
+        0, 0,
+        ctypes.c_ulong(int(notches) * WHEEL_DELTA),
+        0x0800,  # MOUSEEVENTF_WHEEL
+        0,
+        None,
+    )
+    _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+
+def _native_key(vk, key_up=False):
+    inp = INPUT()
+    inp.type = INPUT_KEYBOARD
+    inp.ki = KEYBDINPUT(
+        int(vk), 0,
+        KEYEVENTF_KEYUP if key_up else 0,
+        0,
+        None,
+    )
+    _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+
+def native_zoom_in():
+    # Ctrl + '+' = Ctrl + Shift + '=' on a standard US-style keyboard.
+    _native_key(VK_CONTROL)
+    _native_key(VK_SHIFT)
+    _native_key(VK_OEM_PLUS)
+    _native_key(VK_OEM_PLUS, True)
+    _native_key(VK_SHIFT, True)
+    _native_key(VK_CONTROL, True)
+
+def native_zoom_out():
+    # Ctrl + '-'
+    _native_key(VK_CONTROL)
+    _native_key(VK_OEM_MINUS)
+    _native_key(VK_OEM_MINUS, True)
+    _native_key(VK_CONTROL, True)
+
+
+def distance_2d(p1, p2):
+    """Euclidean distance between two normalized 2D landmark points."""
+    dx = float(p1[0]) - float(p2[0])
+    dy = float(p1[1]) - float(p2[1])
+    return (dx * dx + dy * dy) ** 0.5
+
+def send_mouse_wheel(notches):
+    """Send a real Windows mouse-wheel event."""
+    if not notches:
+        return
+    ctypes.windll.user32.mouse_event(
+        MOUSEEVENTF_WHEEL,
+        0,
+        0,
+        int(notches * WHEEL_DELTA),
+        0,
+    )
+
+import numpy as np
+import time
+import tkinter as tk
+from tkinter import ttk
+from collections import deque
+import ctypes
+
+# ============================================================
+# VIRTUAL MOUSE - STABLE / LOW-JITTER VERSION (MULTI-MONITOR)
+# ============================================================
+
+# ============================================================
+# WINDOWS DPI AWARENESS
+# ============================================================
+def enable_dpi_awareness():
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+enable_dpi_awareness()
+
+pyautogui.FAILSAFE = False
+pyautogui.PAUSE = 0.0
+
+running = True
+
+def stop_program():
+    global running
+    running = False
+    try:
+        status_ui.destroy()
+    except Exception:
+        pass
+
+# ============================================================
+# ONE EURO FILTER
+# ============================================================
+def smoothing_factor(dt, cutoff):
+    r = 2.0 * np.pi * cutoff * dt
+    return r / (r + 1.0)
+
+class OneEuroFilter:
+    def __init__(self, t0, x0, min_cutoff=0.55, beta=0.35, d_cutoff=1.0):
+        self.min_cutoff = float(min_cutoff)
+        self.beta = float(beta)
+        self.d_cutoff = float(d_cutoff)
+        self.x_prev = float(x0)
+        self.dx_prev = 0.0
+        self.t_prev = float(t0)
+
+    def reset(self, t, x):
+        self.x_prev = float(x)
+        self.dx_prev = 0.0
+        self.t_prev = float(t)
+
+    def __call__(self, t, x):
+        dt = float(t - self.t_prev)
+        if dt <= 0.000001:
+            return self.x_prev
+        dt = min(dt, 0.100)
+
+        dx = (float(x) - self.x_prev) / dt
+        a_d = smoothing_factor(dt, self.d_cutoff)
+        dx_hat = a_d * dx + (1.0 - a_d) * self.dx_prev
+
+        cutoff = self.min_cutoff + self.beta * abs(dx_hat)
+        a = smoothing_factor(dt, cutoff)
+        x_hat = a * float(x) + (1.0 - a) * self.x_prev
+
+        self.x_prev = x_hat
+        self.dx_prev = dx_hat
+        self.t_prev = float(t)
+        return x_hat
+
+# ============================================================
+# ROBUST 3-SAMPLE MEDIAN
+# ============================================================
+class Median3:
+    def __init__(self, initial):
+        self.values = deque(maxlen=3)
+        self.values.append(float(initial))
+
+    def reset(self, value):
+        self.values.clear()
+        self.values.append(float(value))
+
+    def update(self, value):
+        self.values.append(float(value))
+        return float(np.median(np.asarray(self.values, dtype=np.float64)))
+
+# ============================================================
+# STATIONARY LOCK WITH HYSTERESIS
+# ============================================================
+class StationaryLock:
+    def __init__(self, enter_speed_px=7.0, exit_speed_px=14.0, enter_frames=7, exit_frames=2):
+        self.enter_speed_px = float(enter_speed_px)
+        self.exit_speed_px = float(exit_speed_px)
+        self.enter_frames = int(enter_frames)
+        self.exit_frames = int(exit_frames)
+        self.locked = False
+        self.still_count = 0
+        self.move_count = 0
+
+    def update(self, speed_px_s, dt):
+        displacement = speed_px_s * dt
+        if self.locked:
+            if displacement >= self.exit_speed_px * dt:
+                self.move_count += 1
+            else:
+                self.move_count = 0
+            if self.move_count >= self.exit_frames:
+                self.locked = False
+                self.still_count = 0
+                self.move_count = 0
+        else:
+            if displacement <= self.enter_speed_px * dt:
+                self.still_count += 1
+            else:
+                self.still_count = 0
+            if self.still_count >= self.enter_frames:
+                self.locked = True
+                self.move_count = 0
+        return self.locked
+
+# ============================================================
+# GESTURE HYSTERESIS
+# ============================================================
+class StableBool:
+    def __init__(self, on_frames=3, off_frames=4):
+        self.on_frames = int(on_frames)
+        self.off_frames = int(off_frames)
+        self.state = False
+        self.on_count = 0
+        self.off_count = 0
+
+    def update(self, value):
+        value = bool(value)
+        if value:
+            self.on_count += 1
+            self.off_count = 0
+            if not self.state and self.on_count >= self.on_frames:
+                self.state = True
+        else:
+            self.off_count += 1
+            self.on_count = 0
+            if self.state and self.off_count >= self.off_frames:
+                self.state = False
+        return self.state
+
+# ============================================================
+# CAMERA SELECTION
+# ============================================================
+selected_cam_index = 1
+
+def start_virtual_mouse():
+    global selected_cam_index
+    selection = cam_combobox.get()
+    if "Bawaan" in selection or "0" in selection:
+        selected_cam_index = 0
+    else:
+        selected_cam_index = 1
+    root.destroy()
+
+def close_application():
+    root.destroy()
+    raise SystemExit
+
+root = tk.Tk()
+root.title("Pilih Kamera - Virtual Mouse Pro")
+root.geometry("320x230")
+root.config(bg="#1e1e1e")
+root.attributes("-topmost", True)
+
+label = tk.Label(root, text="PILIH KAMERA WEBCAM:", fg="#ffffff", bg="#1e1e1e", font=("Arial", 10, "bold"))
+label.pack(pady=(20, 10))
+
+cam_options = ["Fantech (Indeks 1)", "Webcam Bawaan (Indeks 0)"]
+cam_combobox = ttk.Combobox(root, values=cam_options, state="readonly", width=25, font=("Arial", 10))
+cam_combobox.pack(pady=5)
+cam_combobox.current(0)
+
+start_btn = tk.Button(root, text="START VIRTUAL MOUSE", bg="#00ffcc", fg="#000000", font=("Arial", 10, "bold"), command=start_virtual_mouse)
+start_btn.pack(pady=10)
+
+close_btn = tk.Button(root, text="CLOSE APP", bg="#ff4444", fg="#ffffff", font=("Arial", 9, "bold"), bd=0, command=close_application)
+close_btn.pack(pady=5)
+
+root.mainloop()
+
+# ============================================================
+# FLOATING STATUS UI
+# ============================================================
+status_ui = tk.Tk()
+status_ui.overrideredirect(True)
+status_ui.attributes("-topmost", True)
+status_ui.attributes("-alpha", 0.85)
+
+# ============================================================
+# MULTI-MONITOR / VIRTUAL DESKTOP GEOMETRY
+# ============================================================
+def get_virtual_screen_geometry():
+    if hasattr(ctypes, "windll"):
+        user32 = ctypes.windll.user32
+        SM_XVIRTUALSCREEN = 76
+        SM_YVIRTUALSCREEN = 77
+        SM_CXVIRTUALSCREEN = 78
+        SM_CYVIRTUALSCREEN = 79
+        left = int(user32.GetSystemMetrics(SM_XVIRTUALSCREEN))
+        top = int(user32.GetSystemMetrics(SM_YVIRTUALSCREEN))
+        width = int(user32.GetSystemMetrics(SM_CXVIRTUALSCREEN))
+        height = int(user32.GetSystemMetrics(SM_CYVIRTUALSCREEN))
+        if width > 0 and height > 0:
+            return left, top, width, height
+    width, height = pyautogui.size()
+    return 0, 0, int(width), int(height)
+
+screen_left, screen_top, screen_width, screen_height = get_virtual_screen_geometry()
+
+window_width, window_height = 250, 65
+
+primary_width, primary_height = pyautogui.size()
+pos_x = 20
+pos_y = primary_height - window_height - 60
+
+status_ui.geometry(f"{window_width}x{window_height}+{pos_x}+{pos_y}")
+status_ui.config(bg="#1e1e1e")
+
+def start_move(event):
+    status_ui._x = event.x
+    status_ui._y = event.y
+
+def do_move(event):
+    x = status_ui.winfo_pointerx() - status_ui._x
+    y = status_ui.winfo_pointery() - status_ui._y
+    status_ui.geometry(f"+{x}+{y}")
+
+status_ui.bind("<Button-1>", start_move)
+status_ui.bind("<B1-Motion>", do_move)
+
+main_frame = tk.Frame(status_ui, bg="#1e1e1e")
+main_frame.pack(fill="both", expand=True, padx=10, pady=8)
+
+left_frame = tk.Frame(main_frame, bg="#1e1e1e")
+left_frame.pack(side="left", fill="both", expand=True)
+
+title_label = tk.Label(left_frame, text="VIRTUAL MOUSE • LOW JITTER", fg="#888888", bg="#1e1e1e", font=("Arial", 8, "bold"))
+title_label.pack(anchor="w")
+
+status_text_var = tk.StringVar(value="STATUS: CURSOR")
+status_label = tk.Label(left_frame, textvariable=status_text_var, fg="#00ffcc", bg="#1e1e1e", font=("Arial", 10, "bold"))
+status_label.pack(anchor="w", pady=(2, 0))
+
+close_x_btn = tk.Button(main_frame, text="X", bg="#ff4444", fg="#ffffff", font=("Arial", 9, "bold"), bd=0, relief="flat", command=stop_program)
+close_x_btn.pack(side="right", padx=(8, 0), ipadx=6, ipady=4)
+
+def update_gui(mode_val, paused_val, locked_val):
+    try:
+        if paused_val:
+            status_text_var.set("STATUS: PAUSED")
+            status_label.config(fg="#ff4444")
+        elif locked_val:
+            status_text_var.set("STATUS: CURSOR • LOCKED")
+            status_label.config(fg="#66ff99")
+        elif mode_val == "CURSOR":
+            status_text_var.set("STATUS: CURSOR")
+            status_label.config(fg="#00ffcc")
+        elif mode_val == "SCROLL":
+            status_text_var.set("STATUS: SCROLL")
+            status_label.config(fg="#ffbb00")
+        else:
+            status_text_var.set("STATUS: ZOOM")
+            status_label.config(fg="#ff66ff")
+    except Exception:
+        pass
+
+# ============================================================
+# MEDIAPIPE HAND LANDMARKER
+# ============================================================
+base_options = python.BaseOptions(model_asset_path="hand_landmarker.task")
+options = vision.HandLandmarkerOptions(
+    base_options=base_options,
+    running_mode=vision.RunningMode.VIDEO,
+    num_hands=1,
+    min_hand_detection_confidence=0.75,
+    min_hand_presence_confidence=0.75,
+    min_tracking_confidence=0.75,
+)
+detector = vision.HandLandmarker.create_from_options(options)
+
+# ============================================================
+# CAMERA
+# ============================================================
+def open_camera(index):
+    cap_local = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+    if not cap_local.isOpened():
+        return None
+    cap_local.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap_local.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap_local.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+    cap_local.set(cv2.CAP_PROP_FPS, 60)
+    cap_local.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap_local
+
+cap = open_camera(selected_cam_index)
+if cap is None:
+    cap = open_camera(0)
+if cap is None:
+    raise RuntimeError("Kamera tidak dapat dibuka.")
+
+# ============================================================
+# STATE
+# ============================================================
+click_cooldown = 0.0
+click_gesture_latched = False
+toggle_cooldown = 0.0
+pause_cooldown = 0.0
+
+current_mode = "CURSOR"
+is_paused = False
+
+current_cursor_x, current_cursor_y = map(float, pyautogui.position())
+
+scroll_accumulator = 0.0
+
+clock = time.perf_counter()
+last_frame_time = clock
+timestamp_ms = 0
+
+frame_margin_x = 0.16
+frame_margin_y = 0.16
+
+# ------------------------------------------------------------
+# FILTER CHAIN
+# ------------------------------------------------------------
+tip_x_filter = None
+tip_y_filter = None
+cursor_tip_x_filter = None
+cursor_tip_y_filter = None
+palm_x_filter = None
+palm_y_filter = None
+
+tip_x_median = None
+tip_y_median = None
+palm_x_median = None
+palm_y_median = None
+
+cursor_screen_x_filter = None
+cursor_screen_y_filter = None
+smooth_joint_points = None
+JOINT_VISUAL_ALPHA = 0.28
+
+stationary_lock = StationaryLock(
+    enter_speed_px=4.0,
+    exit_speed_px=14.0,
+    enter_frames=8,
+    exit_frames=2,
+)
+
+index_up_state = StableBool(on_frames=2, off_frames=3)
+middle_up_state = StableBool(on_frames=2, off_frames=3)
+ring_up_state = StableBool(on_frames=2, off_frames=3)
+pinky_up_state = StableBool(on_frames=2, off_frames=3)
+thumb_extended_state = StableBool(on_frames=2, off_frames=3)
+pause_pose_state = StableBool(on_frames=3, off_frames=5)
+open_palm_state = StableBool(on_frames=1, off_frames=1)
+
+# ZOOM MODE gesture:
+#   index + middle extended
+#   ring + pinky folded
+# This is deliberately different from the normal cursor/click poses.
+zoom_pose_state = StableBool(on_frames=7, off_frames=5)
+zoom_toggle_cooldown = 0.0
+zoom_toggle_latched = False
+open_palm_toggle_latched = False
+
+# Three equal vertical zones for ZOOM mode.
+# TOP    0.00 - 0.425 -> zoom IN
+# CENTER 0.425 - 0.575 -> STOP
+# BOTTOM 0.575 - 1.000 -> zoom OUT
+ZOOM_TOP_LIMIT = 0.425
+ZOOM_BOTTOM_LIMIT = 0.575
+ZOOM_EVENT_INTERVAL = 0.35
+zoom_timer = 0.0
+zoom_zone_name = "CENTER / STOP"
+
+hand_lost_frames = 0
+MAX_HAND_LOST_FRAMES = 8
+
+# ============================================================
+# CURSOR RE-ANCHOR
+# ============================================================
+cursor_control_active = False
+locked_hand_x = None
+locked_hand_y = None
+cursor_anchor_x = 0.5
+cursor_anchor_y = 0.5
+cursor_anchor_screen_x = float(current_cursor_x)
+cursor_anchor_screen_y = float(current_cursor_y)
+
+# ============================================================
+# PINCH ZOOM STATE
+# ============================================================
+# ============================================================
+# PINCH ZOOM - STABLE / LOW-JITTER
+# ============================================================
+pinch_active = False
+pinch_distance_ema = None
+pinch_reference_distance = None
+pinch_last_zoom_time = 0.0
+pinch_accumulator = 0.0
+pinch_start_count = 0
+pinch_release_count = 0
+
+# Normalized thumb-index distance:
+# smaller = fingers closer, larger = fingers farther apart.
+PINCH_START_DISTANCE = 0.42
+PINCH_RELEASE_DISTANCE = 0.62
+PINCH_MIN_DISTANCE = 0.12
+PINCH_MAX_DISTANCE = 1.50
+PINCH_START_FRAMES = 3
+PINCH_RELEASE_FRAMES = 4
+PINCH_EMA_ALPHA = 0.35
+
+# Lower value = easier/faster zooming.
+PINCH_ZOOM_STEP = 0.025
+PINCH_ZOOM_COOLDOWN = 0.055
+
+# ============================================================
+# LANDMARK HELPERS
+# ============================================================
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12), (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20), (0, 17)
+]
+
+def landmark_xy(landmark):
+    return np.array([float(landmark.x), float(landmark.y)], dtype=np.float64)
+
+def palm_center(landmarks):
+    ids = [0, 5, 9, 13, 17]
+    pts = np.array([[landmarks[i].x, landmarks[i].y] for i in ids], dtype=np.float64)
+    return np.mean(pts, axis=0)
+
+def normalized_pinch_distance(landmarks):
+    thumb = np.array([landmarks[4].x, landmarks[4].y], dtype=np.float64)
+    index = np.array([landmarks[8].x, landmarks[8].y], dtype=np.float64)
+    wrist = np.array([landmarks[0].x, landmarks[0].y], dtype=np.float64)
+    middle_mcp = np.array([landmarks[9].x, landmarks[9].y], dtype=np.float64)
+
+    pinch_distance = float(np.linalg.norm(thumb - index))
+    palm_scale = max(float(np.linalg.norm(middle_mcp - wrist)), 1e-4)
+
+    # Normalize by apparent palm size so pinch sensitivity stays consistent
+    # when the hand moves closer to or farther from the camera.
+    return pinch_distance / palm_scale
+
+# Adaptive cursor response for camera distance.
+ADAPTIVE_CURSOR_MIN_GAIN = 1.00
+ADAPTIVE_CURSOR_MAX_GAIN = 2.40
+ADAPTIVE_CURSOR_REFERENCE_PALM = 0.115
+ADAPTIVE_CURSOR_DEADZONE_MIN = 0.25
+ADAPTIVE_CURSOR_DEADZONE_MAX = 0.70
+
+def reset_cursor_anchor(raw_tip_x, raw_tip_y):
+    global cursor_control_active, cursor_anchor_x, cursor_anchor_y
+    global cursor_anchor_screen_x, cursor_anchor_screen_y
+    cursor_anchor_x = float(raw_tip_x)
+    cursor_anchor_y = float(raw_tip_y)
+    cursor_anchor_screen_x = float(current_cursor_x)
+    cursor_anchor_screen_y = float(current_cursor_y)
+    cursor_control_active = True
+
+def reset_pinch_state():
+    global pinch_active, pinch_distance_ema, pinch_reference_distance
+    global pinch_start_count, pinch_release_count, pinch_accumulator
+    pinch_active = False
+    pinch_distance_ema = None
+    pinch_reference_distance = None
+    pinch_start_count = 0
+    pinch_release_count = 0
+    pinch_accumulator = 0.0
+
+def update_pinch_zoom(landmarks, now):
+    """
+    Returns:
+        +1 = zoom IN
+        -1 = zoom OUT
+         0 = no zoom
+
+    Pinch distance is normalized by palm size so camera distance does not
+    dramatically change the response.
+    """
+    global pinch_active
+    global pinch_distance_ema, pinch_reference_distance
+    global pinch_start_count, pinch_release_count
+    global pinch_last_zoom_time, pinch_accumulator
+
+    distance = normalized_pinch_distance(landmarks)
+
+    # Keep the EMA alive even when the hand is temporarily outside the
+    # comfortable pinch range.
+    if not (PINCH_MIN_DISTANCE <= distance <= PINCH_MAX_DISTANCE):
+        return 0
+
+    if pinch_distance_ema is None:
+        pinch_distance_ema = distance
+    else:
+        pinch_distance_ema = (
+            PINCH_EMA_ALPHA * distance
+            + (1.0 - PINCH_EMA_ALPHA) * pinch_distance_ema
+        )
+
+    d = pinch_distance_ema
+
+    # ------------------------------------------------------------
+    # PINCH START
+    # ------------------------------------------------------------
+    if not pinch_active:
+        if d <= PINCH_START_DISTANCE:
+            pinch_start_count += 1
+        else:
+            pinch_start_count = 0
+
+        if pinch_start_count >= PINCH_START_FRAMES:
+            pinch_active = True
+            pinch_reference_distance = d
+            pinch_accumulator = 0.0
+            pinch_release_count = 0
+
+        return 0
+
+    # ------------------------------------------------------------
+    # PINCH RELEASE
+    # ------------------------------------------------------------
+    if d >= PINCH_RELEASE_DISTANCE:
+        pinch_release_count += 1
+    else:
+        pinch_release_count = 0
+
+    if pinch_release_count >= PINCH_RELEASE_FRAMES:
+        pinch_active = False
+        pinch_reference_distance = None
+        pinch_accumulator = 0.0
+        pinch_start_count = 0
+        pinch_release_count = 0
+        return 0
+
+    if pinch_reference_distance is None:
+        pinch_reference_distance = d
+        return 0
+
+    # ------------------------------------------------------------
+    # RELATIVE PINCH MOVEMENT
+    #
+    # d gets SMALLER  -> thumb/index move together -> ZOOM IN
+    # d gets LARGER   -> thumb/index move apart    -> ZOOM OUT
+    # ------------------------------------------------------------
+    delta = pinch_reference_distance - d
+    pinch_accumulator += delta
+    pinch_reference_distance = d
+
+    if now - pinch_last_zoom_time < PINCH_ZOOM_COOLDOWN:
+        return 0
+
+    if pinch_accumulator >= PINCH_ZOOM_STEP:
+        pinch_accumulator -= PINCH_ZOOM_STEP
+        pinch_last_zoom_time = now
+        return +1
+
+    if pinch_accumulator <= -PINCH_ZOOM_STEP:
+        pinch_accumulator += PINCH_ZOOM_STEP
+        pinch_last_zoom_time = now
+        return -1
+
+    return 0
+
+def reset_filters(t, tip, palm):
+    global tip_x_filter, tip_y_filter, cursor_tip_x_filter, cursor_tip_y_filter, palm_x_filter, palm_y_filter
+    global tip_x_median, tip_y_median, palm_x_median, palm_y_median
+    global cursor_screen_x_filter, cursor_screen_y_filter, smooth_joint_points
+    # Dedicated low-latency cursor filters:
+    # higher cutoff + stronger velocity response = less lag while preserving
+    # the existing stable filters used by scroll.
+    cursor_tip_x_filter = OneEuroFilter(t, tip[0], min_cutoff=1.05, beta=0.65, d_cutoff=1.2)
+    cursor_tip_y_filter = OneEuroFilter(t, tip[1], min_cutoff=1.05, beta=0.65, d_cutoff=1.2)
+
+    tip_x_filter = OneEuroFilter(t, tip[0], min_cutoff=0.70, beta=0.85, d_cutoff=1.0)
+    tip_y_filter = OneEuroFilter(t, tip[1], min_cutoff=0.70, beta=0.85, d_cutoff=1.0)
+    palm_x_filter = OneEuroFilter(t, palm[0], min_cutoff=0.45, beta=0.55, d_cutoff=1.0)
+    palm_y_filter = OneEuroFilter(t, palm[1], min_cutoff=0.45, beta=0.55, d_cutoff=1.0)
+    tip_x_median = Median3(tip[0])
+    tip_y_median = Median3(tip[1])
+    palm_x_median = Median3(palm[0])
+    palm_y_median = Median3(palm[1])
+
+    cursor_screen_x_filter = None
+    cursor_screen_y_filter = None
+    smooth_joint_points = None
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+print(">>> VIRTUAL MOUSE LOW-JITTER MODE AKTIF")
+
+scroll_timer = 0.0
+scroll_direction = 0
+scroll_zone_name = "CENTER / STOP"
+
+# UI state must always exist, including when a hand is currently detected.
+is_fist = False
+
+while cap.isOpened() and running:
+    try:
+        status_ui.update_idletasks()
+        status_ui.update()
+    except Exception:
+        break
+
+    if not running:
+        break
+
+    success, frame = cap.read()
+    if not success or frame is None:
+        continue
+
+    frame = cv2.flip(frame, 1)
+    h, w, _ = frame.shape
+
+    # ========================================================
+    # SCROLL ZONE GUIDE
+    # ========================================================
+    if current_mode == "SCROLL":
+        top_line = int(h * 0.425)
+        bottom_line = int(h * 0.575)
+
+        # 42.5% TOP / 15% CENTER / 42.5% BOTTOM
+        cv2.line(frame, (0, top_line), (w, top_line), (0, 255, 255), 2)
+        cv2.line(frame, (0, bottom_line), (w, bottom_line), (0, 255, 255), 2)
+
+        cv2.putText(
+            frame, "SCROLL UP - TOP 42.5%",
+            (15, max(30, top_line // 2)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2
+        )
+
+        center_y = top_line + (bottom_line - top_line) // 2
+        cv2.putText(
+            frame, "STOP - CENTER 15%",
+            (15, center_y),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2
+        )
+
+        bottom_center_y = bottom_line + (h - bottom_line) // 2
+        cv2.putText(
+            frame, "SCROLL DOWN - BOTTOM 42.5%",
+            (15, bottom_center_y),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2
+        )
+
+        cv2.putText(
+            frame,
+            scroll_zone_name,
+            (max(15, w - 300), 35),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 0, 255),
+            2
+        )
+
+    now = time.perf_counter()
+    dt = now - last_frame_time
+    last_frame_time = now
+
+    dt = float(np.clip(dt, 1.0 / 240.0, 0.100))
+    new_timestamp_ms = max(timestamp_ms + 1, int(now * 1000))
+    timestamp_ms = new_timestamp_ms
+
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    detection_result = detector.detect_for_video(mp_image, timestamp_ms)
+
+    # This script currently does not use fist as an active control gesture.
+    # Keep it explicitly false so the status renderer can never reference
+    # an undefined variable.
+    is_fist = False
+
+    # --------------------------------------------------------
+    # HAND FOUND
+    # --------------------------------------------------------
+    if detection_result.hand_landmarks:
+        hand_lost_frames = 0
+        raw_landmarks = detection_result.hand_landmarks[0]
+
+        # ============================================================
+        # 21 JOINTS - ALWAYS VISIBLE
+        # Red dots are drawn from the RAW MediaPipe landmarks.
+        # This is visualization only and does not affect pinch/cursor.
+        # ============================================================
+        # Visual-only EMA for all 21 joints. Gesture logic still uses
+        # the raw MediaPipe landmarks below.
+        if smooth_joint_points is None or len(smooth_joint_points) != 21:
+            smooth_joint_points = [
+                [float(lm.x), float(lm.y)]
+                for lm in raw_landmarks
+            ]
+        else:
+            a_smooth = JOINT_VISUAL_ALPHA
+            for joint_id, lm in enumerate(raw_landmarks):
+                smooth_joint_points[joint_id][0] = (
+                    a_smooth * float(lm.x)
+                    + (1.0 - a_smooth) * smooth_joint_points[joint_id][0]
+                )
+                smooth_joint_points[joint_id][1] = (
+                    a_smooth * float(lm.y)
+                    + (1.0 - a_smooth) * smooth_joint_points[joint_id][1]
+                )
+
+        for a, b in HAND_CONNECTIONS:
+            p1 = (
+                int(raw_landmarks[a].x * w),
+                int(raw_landmarks[a].y * h),
+            )
+            p2 = (
+                int(raw_landmarks[b].x * w),
+                int(raw_landmarks[b].y * h),
+            )
+            cv2.line(frame, p1, p2, (0, 0, 0), 7, cv2.LINE_AA)
+            cv2.line(frame, p1, p2, (0, 255, 0), 3, cv2.LINE_AA)
+
+        for joint_id, lm in enumerate(raw_landmarks):
+            x = max(
+                0,
+                min(w - 1, int(smooth_joint_points[joint_id][0] * w))
+            )
+            y = max(
+                0,
+                min(h - 1, int(smooth_joint_points[joint_id][1] * h))
+            )
+
+            # Black outline + red joint + white center.
+            cv2.circle(frame, (x, y), 12, (0, 0, 0), -1, cv2.LINE_AA)
+            cv2.circle(frame, (x, y), 8, (0, 0, 255), -1, cv2.LINE_AA)
+            cv2.circle(frame, (x, y), 2, (255, 255, 255), -1, cv2.LINE_AA)
+
+            cv2.putText(
+                frame,
+                str(joint_id),
+                (x + 10, y - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.40,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+
+        for a, b in HAND_CONNECTIONS:
+            p1 = (
+                int(smooth_joint_points[a][0] * w),
+                int(smooth_joint_points[a][1] * h),
+            )
+            p2 = (
+                int(smooth_joint_points[b][0] * w),
+                int(smooth_joint_points[b][1] * h),
+            )
+            cv2.line(frame, p1, p2, (0, 255, 0), 2)
+
+        raw_tip = landmark_xy(raw_landmarks[8])
+        raw_palm = palm_center(raw_landmarks)
+
+        if tip_x_filter is None:
+            reset_filters(now, raw_tip, raw_palm)
+
+        tip_med_x = tip_x_median.update(raw_tip[0])
+        tip_med_y = tip_y_median.update(raw_tip[1])
+        palm_med_x = palm_x_median.update(raw_palm[0])
+        palm_med_y = palm_y_median.update(raw_palm[1])
+
+        smooth_tip_x = tip_x_filter(now, tip_med_x)
+        smooth_tip_y = tip_y_filter(now, tip_med_y)
+
+        # Cursor path intentionally bypasses the 3-sample median. The One Euro
+        # filter handles noise while avoiding the extra frame(s) of median delay.
+        cursor_tip_x = cursor_tip_x_filter(now, raw_tip[0])
+        cursor_tip_y = cursor_tip_y_filter(now, raw_tip[1])
+        cursor_tip_velocity = float(np.hypot(
+            cursor_tip_x_filter.dx_prev,
+            cursor_tip_y_filter.dx_prev
+        ))
+
+        smooth_palm_x = palm_x_filter(now, palm_med_x)
+        smooth_palm_y = palm_y_filter(now, palm_med_y)
+
+        tip_velocity = np.hypot(tip_x_filter.dx_prev, tip_y_filter.dx_prev)
+        dynamic_tip_weight = float(np.clip(0.68 + tip_velocity * 0.12, 0.68, 0.88))
+
+        hybrid_x = (dynamic_tip_weight * smooth_tip_x + (1.0 - dynamic_tip_weight) * smooth_palm_x)
+        hybrid_y = (dynamic_tip_weight * smooth_tip_y + (1.0 - dynamic_tip_weight) * smooth_palm_y)
+
+        index_up_raw = raw_landmarks[8].y < raw_landmarks[6].y
+        middle_up_raw = raw_landmarks[12].y < raw_landmarks[10].y
+        ring_up_raw = raw_landmarks[16].y < raw_landmarks[14].y
+        pinky_up_raw = raw_landmarks[20].y < raw_landmarks[18].y
+        thumb_dx = abs(raw_landmarks[4].x - raw_landmarks[0].x)
+        thumb_extended_raw = thumb_dx > 0.12
+
+        is_index_up = index_up_state.update(index_up_raw)
+        is_middle_up = middle_up_state.update(middle_up_raw)
+        is_ring_up = ring_up_state.update(ring_up_raw)
+        is_pinky_up = pinky_up_state.update(pinky_up_raw)
+        is_thumb_extended = thumb_extended_state.update(thumb_extended_raw)
+
+        # Open palm = SCROLL toggle.
+        # Distance-independent OPEN PALM confirmation.
+        # All distances are normalized by palm width, so the gesture remains
+        # reliable when the hand is close to or far from the webcam.
+        palm_scale = max(
+            distance_2d(
+                (raw_landmarks[5].x, raw_landmarks[5].y),
+                (raw_landmarks[17].x, raw_landmarks[17].y),
+            ),
+            0.035,
+        )
+
+        palm_center_xy = (
+            (raw_landmarks[0].x + raw_landmarks[5].x + raw_landmarks[17].x) / 3.0,
+            (raw_landmarks[0].y + raw_landmarks[5].y + raw_landmarks[17].y) / 3.0,
+        )
+
+        def normalized_extension(tip_id, mcp_id):
+            tip_d = distance_2d(
+                (raw_landmarks[tip_id].x, raw_landmarks[tip_id].y),
+                palm_center_xy,
+            )
+            mcp_d = distance_2d(
+                (raw_landmarks[mcp_id].x, raw_landmarks[mcp_id].y),
+                palm_center_xy,
+            )
+            return (tip_d - mcp_d) / palm_scale
+
+        normalized_open = (
+            normalized_extension(8, 5) > 0.55
+            and normalized_extension(12, 9) > 0.45
+            and normalized_extension(16, 13) > 0.35
+            and normalized_extension(20, 17) > 0.30
+        )
+
+        is_open_palm_raw = (
+            is_index_up
+            and is_middle_up
+            and is_ring_up
+            and is_pinky_up
+            and is_thumb_extended
+            and normalized_open
+        )
+        is_open_palm = open_palm_state.update(is_open_palm_raw)
+
+        # Distance-independent ZOOM trigger:
+        # OK SIGN extended, while MIDDLE + RING are folded.
+        # This uses normalized landmark geometry so it remains usable
+        # when the hand is near/far from the camera.
+        index_ext = normalized_extension(8, 5)
+        middle_ext = normalized_extension(12, 9)
+        ring_ext = normalized_extension(16, 13)
+        pinky_ext = normalized_extension(20, 17)
+
+        # ------------------------------------------------------------
+        # ZOOM TRIGGER = OK SIGN
+        # ------------------------------------------------------------
+        # Thumb + index form a small closed circle, while middle/ring/pinky
+        # stay extended. This is deliberately different from open-palm,
+        # pinch and the old index+pinky trigger.
+        #
+        # Use normalized distances so the gesture works when the hand moves
+        # closer to / farther from the camera.
+        thumb_tip = (raw_landmarks[4].x, raw_landmarks[4].y)
+        index_tip = (raw_landmarks[8].x, raw_landmarks[8].y)
+        middle_tip = (raw_landmarks[12].x, raw_landmarks[12].y)
+        ring_tip = (raw_landmarks[16].x, raw_landmarks[16].y)
+        pinky_tip = (raw_landmarks[20].x, raw_landmarks[20].y)
+
+        thumb_index_gap = distance_2d(thumb_tip, index_tip) / palm_scale
+
+        # ------------------------------------------------------------
+        # STRICT OK-SIGN ZOOM TRIGGER
+        # ------------------------------------------------------------
+        # Deliberately conservative: the thumb/index circle must be tight,
+        # the other three fingers must be clearly extended, and the pose
+        # must remain stable for several frames before ZOOM can arm.
+        thumb_index_gap = distance_2d(thumb_tip, index_tip) / palm_scale
+
+        ok_sign_raw = (
+            thumb_index_gap < 0.27
+            and middle_ext > 0.42
+            and ring_ext > 0.36
+            and pinky_ext > 0.34
+            and is_middle_up
+            and is_ring_up
+            and is_pinky_up
+            # Index must not simply be pointing; it has to be part of
+            # the closed thumb/index loop.
+            and index_ext < 0.70
+        )
+
+        zoom_pose_raw = ok_sign_raw
+
+        # Require a deliberate hold before ZOOM can trigger.
+        is_zoom_pose = zoom_pose_state.update(zoom_pose_raw)
+
+        is_pause_pose_raw = (
+            is_thumb_extended
+            and is_pinky_up
+            and not is_index_up
+            and not is_middle_up
+            and not is_ring_up
+        )
+        is_pause_pose = pause_pose_state.update(is_pause_pose_raw)
+
+        if (is_pause_pose and pause_cooldown <= 0.0):
+            is_paused = not is_paused
+            pause_cooldown = 0.80
+            if is_paused:
+                cursor_control_active = False
+        # ZOOM pose toggles ZOOM mode.
+        # One trigger pose = one mode toggle.
+        # Holding the OK sign does not repeatedly toggle ZOOM.
+        if not is_zoom_pose:
+            zoom_toggle_latched = False
+
+        if (
+            not is_paused
+            and is_zoom_pose
+            and not zoom_toggle_latched
+            and zoom_toggle_cooldown <= 0.0
+        ):
+            if current_mode == "ZOOM":
+                current_mode = "CURSOR"
+            else:
+                current_mode = "ZOOM"
+
+            zoom_toggle_latched = True
+            zoom_toggle_cooldown = 0.70
+            cursor_control_active = False
+            stationary_lock.locked = False
+            zoom_timer = 0.0
+            scroll_accumulator = 0.0
+
+        # OPEN PALM = fast mode control.
+        #
+        # In ZOOM:
+        #   5 fingers OPEN -> immediately return to CURSOR.
+        #
+        # Outside ZOOM:
+        #   5 fingers OPEN -> toggle CURSOR <-> SCROLL.
+        #
+        # One open-palm gesture produces exactly one mode switch.
+        if not is_open_palm:
+            open_palm_toggle_latched = False
+
+        # ------------------------------------------------------------
+        # ZOOM -> CURSOR EXIT
+        # ------------------------------------------------------------
+        # This is intentionally checked before the normal CURSOR<->SCROLL
+        # toggle. The latch prevents the same open palm from immediately
+        # switching CURSOR -> SCROLL on the next line.
+        if (
+            not is_paused
+            and current_mode == "ZOOM"
+            and is_open_palm
+            and not open_palm_toggle_latched
+        ):
+            current_mode = "CURSOR"
+            open_palm_toggle_latched = True
+            toggle_cooldown = 0.18
+            zoom_timer = 0.0
+            cursor_control_active = False
+            stationary_lock.locked = False
+            scroll_timer = 0.0
+            scroll_direction = 0
+            scroll_zone_name = "CENTER / STOP"
+
+        # ------------------------------------------------------------
+        # CURSOR <-> SCROLL
+        # ------------------------------------------------------------
+        if (
+            not is_paused
+            and current_mode != "ZOOM"
+            and is_open_palm
+            and not open_palm_toggle_latched
+            and toggle_cooldown <= 0.0
+        ):
+            current_mode = (
+                "SCROLL" if current_mode == "CURSOR" else "CURSOR"
+            )
+            open_palm_toggle_latched = True
+            toggle_cooldown = 0.18
+            cursor_control_active = False
+            stationary_lock.locked = False
+            scroll_timer = 0.0
+            scroll_accumulator = 0.0
+
+        # ========================================================
+        if (not is_paused and current_mode == "SCROLL"):
+            # Index fingertip selects the three vertical scroll zones.
+            raw_index_y = float(raw_landmarks[8].y)
+            scroll_y = float(np.clip(
+                0.70 * raw_index_y + 0.30 * smooth_tip_y,
+                0.0, 1.0
+            ))
+
+            previous_scroll_direction = scroll_direction
+
+            if scroll_y < 0.425:
+                # TOP 42.5% -> normal mouse-wheel UP
+                scroll_direction = 1
+                scroll_zone_name = "TOP / SCROLL UP"
+            elif scroll_y > 0.575:
+                # BOTTOM 42.5% -> normal mouse-wheel DOWN
+                scroll_direction = -1
+                scroll_zone_name = "BOTTOM / SCROLL DOWN"
+            else:
+                # CENTER 15% -> stop completely
+                scroll_direction = 0
+                scroll_zone_name = "CENTER / STOP"
+
+            # Native Windows wheel events at a controlled, natural rate.
+            # Reset the cadence when changing direction so the first scroll
+            # after crossing the center does not fire abruptly.
+            if scroll_direction != previous_scroll_direction:
+                scroll_timer = 0.0
+
+            if scroll_direction != 0:
+                scroll_timer += dt
+                if scroll_timer >= 0.095:
+                    # Same native wheel engine, just slightly slower.
+                    native_mouse_wheel(scroll_direction)
+                    scroll_timer -= 0.095
+            else:
+                scroll_timer = 0.0
+
+        # Scroll Mode must never engage cursor lock.
+        # Cursor lock is only meaningful in Cursor Mode.
+        if current_mode == "SCROLL":
+            cursor_control_active = False
+            cursor_locked = False
+            stationary_lock.locked = False
+
+        # ========================================================
+        # ZOOM MODE
+        # ========================================================
+        elif (not is_paused and current_mode == "ZOOM"):
+
+            # Use the smoothed index fingertip Y position. While the index finger
+            # remains in the top/bottom zone, zoom repeats slowly and continuously.
+            raw_index_y = float(raw_landmarks[8].y)
+            zoom_y = float(np.clip(
+                0.70 * raw_index_y + 0.30 * smooth_tip_y,
+                0.0, 1.0
+            ))
+
+            if zoom_y < ZOOM_TOP_LIMIT:
+                # TOP 42.5% = ZOOM IN
+                zoom_direction = 1
+                zoom_zone_name = "TOP / ZOOM IN"
+
+            elif zoom_y >= ZOOM_BOTTOM_LIMIT:
+                # BOTTOM 42.5% = ZOOM OUT
+                zoom_direction = -1
+                zoom_zone_name = "BOTTOM / ZOOM OUT"
+
+            else:
+                # CENTER 15% = STOP
+                zoom_direction = 0
+                zoom_zone_name = "CENTER / STOP"
+                zoom_timer = 0.0
+
+            # ZOOM MODE owns native keyboard input. Cursor must not move.
+            cursor_control_active = False
+            stationary_lock.locked = False
+            stationary_lock.still_count = 0
+            stationary_lock.move_count = 0
+
+            if zoom_direction != 0:
+                zoom_timer += dt
+
+                if zoom_timer >= ZOOM_EVENT_INTERVAL:
+                    # Actual keyboard zoom shortcuts:
+                    # TOP    -> Ctrl + +
+                    # BOTTOM -> Ctrl + -
+                    #
+                    # On a standard keyboard, '+' is Shift+'='.
+                    # Sending the three keys explicitly is more reliable
+                    # than pyautogui.hotkey("ctrl", "+") across layouts.
+                    if zoom_direction > 0:
+                        native_zoom_in()
+                    else:
+                        native_zoom_out()
+
+                    zoom_timer = 0.0
+            else:
+                zoom_timer = 0.0
+
+        # CURSOR MODE
+        # ========================================================
+        elif (not is_paused and current_mode == "CURSOR"):
+
+            cursor_pose = (
+                is_index_up
+                and not is_middle_up
+                and not is_ring_up
+                and not is_pinky_up
+                            )
+
+            if cursor_pose and not cursor_control_active:
+                reset_cursor_anchor(cursor_tip_x, cursor_tip_y)
+                locked_hand_x = float(cursor_tip_x)
+                locked_hand_y = float(cursor_tip_y)
+                stationary_lock.still_count = 0
+                stationary_lock.move_count = 0
+                stationary_lock.locked = False
+
+            elif not cursor_pose:
+                cursor_control_active = False
+                stationary_lock.locked = False
+
+            # CLICK GESTURES
+            # A continuous gesture is a single click, not a held/repeating click.
+            # The gesture must disappear before another click can be armed.
+            right_click_pose = (
+                is_index_up and is_middle_up and is_ring_up
+                and not is_pinky_up             )
+            left_click_pose = (
+                is_index_up and is_middle_up
+                and not is_ring_up and not is_pinky_up
+                            )
+            click_pose = right_click_pose or left_click_pose
+
+            if click_pose:
+                cursor_control_active = False
+
+                if not click_gesture_latched and click_cooldown <= 0.0:
+                    if right_click_pose:
+                        pyautogui.rightClick()
+                        click_cooldown = 0.45
+                    else:
+                        pyautogui.click()
+                        click_cooldown = 0.35
+
+                    click_gesture_latched = True
+
+            else:
+                # Re-arm only after the click fingers are no longer shown.
+                click_gesture_latched = False
+
+            if not click_pose and cursor_pose and cursor_control_active:
+                CURSOR_SENSITIVITY = 1.15
+                relative_x = cursor_tip_x - cursor_anchor_x
+                relative_y = cursor_tip_y - cursor_anchor_y
+
+                usable_width = (screen_width * (1.0 - 2.0 * frame_margin_x))
+                usable_height = (screen_height * (1.0 - 2.0 * frame_margin_y))
+
+                # The cursor origin is frozen when the finger becomes
+                # stationary. When movement resumes, displacement is measured
+                # from that frozen fingertip position, so the cursor starts
+                # moving from its last stopped screen position.
+                # IMPORTANT:
+                # Do NOT overwrite locked_hand_x/Y while stationary_lock is
+                # active. Doing that every frame makes the lock chase the
+                # fingertip and can prevent the cursor from ever unlocking.
+                if stationary_lock.locked:
+                    # Freeze only the cursor target; keep the original anchor.
+                    pass
+
+                if locked_hand_x is None or locked_hand_y is None:
+                    locked_hand_x = float(cursor_tip_x)
+                    locked_hand_y = float(cursor_tip_y)
+
+                # Automatically compensate for camera distance.
+                # Smaller apparent palm = farther hand = higher cursor gain.
+                wrist_xy = landmark_xy(raw_landmarks[0])
+                middle_mcp_xy = landmark_xy(raw_landmarks[9])
+                wrist_pt = np.asarray(wrist_xy, dtype=np.float64)
+                middle_mcp_pt = np.asarray(middle_mcp_xy, dtype=np.float64)
+                palm_scale = max(
+                    float(np.linalg.norm(middle_mcp_pt - wrist_pt)),
+                    1e-4
+                )
+
+                adaptive_gain = float(np.clip(
+                    ADAPTIVE_CURSOR_REFERENCE_PALM / palm_scale,
+                    ADAPTIVE_CURSOR_MIN_GAIN,
+                    ADAPTIVE_CURSOR_MAX_GAIN
+                ))
+
+                adaptive_deadzone = float(np.clip(
+                    ADAPTIVE_CURSOR_DEADZONE_MAX / adaptive_gain,
+                    ADAPTIVE_CURSOR_DEADZONE_MIN,
+                    ADAPTIVE_CURSOR_DEADZONE_MAX
+                ))
+
+                locked_relative_x = (cursor_tip_x - locked_hand_x) * adaptive_gain
+                locked_relative_y = (cursor_tip_y - locked_hand_y) * adaptive_gain
+
+                target_x = current_cursor_x + (
+                    locked_relative_x * usable_width * CURSOR_SENSITIVITY
+                )
+                target_y = current_cursor_y + (
+                    locked_relative_y * usable_height * CURSOR_SENSITIVITY
+                )
+
+                target_x = float(target_x)
+                target_y = float(target_y)
+
+                # Final screen-space smoothing removes the small residual
+                # oscillation that gets amplified by cursor sensitivity.
+                if cursor_screen_x_filter is None:
+                    cursor_screen_x_filter = OneEuroFilter(
+                        now, target_x, min_cutoff=0.72, beta=0.28, d_cutoff=1.0
+                    )
+                    cursor_screen_y_filter = OneEuroFilter(
+                        now, target_y, min_cutoff=0.72, beta=0.28, d_cutoff=1.0
+                    )
+
+                target_x = cursor_screen_x_filter(now, target_x)
+                target_y = cursor_screen_y_filter(now, target_y)
+
+                dx_cursor = target_x - current_cursor_x
+                dy_cursor = target_y - current_cursor_y
+                displacement = float(np.hypot(dx_cursor, dy_cursor))
+                speed_px_s = displacement / max(dt, 1e-6)
+
+                locked = stationary_lock.update(speed_px_s, dt)
+
+                if not locked:
+                    MAX_SPEED_PX_S = 5200.0
+                    max_step = MAX_SPEED_PX_S * dt
+                    if displacement > max_step:
+                        scale = max_step / displacement
+                        target_x = (current_cursor_x + dx_cursor * scale)
+                        target_y = (current_cursor_y + dy_cursor * scale)
+
+                    micro_deadzone = max(adaptive_deadzone, 2.2)
+                    dx_final = target_x - current_cursor_x
+                    dy_final = target_y - current_cursor_y
+
+                    if np.hypot(dx_final, dy_final) >= micro_deadzone:
+                        current_cursor_x = float(target_x)
+                        current_cursor_y = float(target_y)
+                        pyautogui.moveTo(
+                            int(round(current_cursor_x)),
+                            int(round(current_cursor_y)),
+                            duration=0
+                        )
+                        locked_hand_x = float(cursor_tip_x)
+                        locked_hand_y = float(cursor_tip_y)
+
+        update_gui(
+            current_mode,
+            is_paused,
+            stationary_lock.locked if current_mode == "CURSOR" else False
+        )
+
+        tip_px = (int(hybrid_x * w), int(hybrid_y * h))
+        palm_px = (int(smooth_palm_x * w), int(smooth_palm_y * h))
+        cv2.circle(frame, tip_px, 7, (255, 0, 255), -1)
+        cv2.circle(frame, palm_px, 5, (255, 255, 0), -1)
+
+        if pinch_distance_ema is not None:
+            cv2.putText(
+                frame,
+                f"{pinch_text}  D={pinch_distance_ema:.3f}",
+                (10, h - 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (255, 255, 0),
+                1,
+            )
+
+        if current_mode == "CURSOR" and stationary_lock.locked:
+            cv2.putText(frame, "CURSOR LOCKED", (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+
+    else:
+        is_fist = False
+        reset_pinch_state()
+        zoom_toggle_latched = False
+        open_palm_toggle_latched = False
+        smooth_joint_points = None
+        cursor_screen_x_filter = None
+        cursor_screen_y_filter = None
+        hand_lost_frames += 1
+        if hand_lost_frames > MAX_HAND_LOST_FRAMES:
+            stationary_lock.locked = True
+            if current_mode == "ZOOM":
+                current_mode = "CURSOR"
+                zoom_timer = 0.0
+
+    click_cooldown = max(0.0, click_cooldown - dt)
+    toggle_cooldown = max(0.0, toggle_cooldown - dt)
+    pause_cooldown = max(0.0, pause_cooldown - dt)
+    zoom_toggle_cooldown = max(0.0, zoom_toggle_cooldown - dt)
+
+    fps = 1.0 / dt if dt > 0 else 0.0
+    cv2.putText(frame, f"FPS: {int(fps)}", (w - 110, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    cv2.putText(
+        frame,
+        f"MODE: {current_mode}",
+        (10, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 255, 0) if current_mode == "CURSOR"
+        else (255, 0, 255) if current_mode == "ZOOM"
+        else (0, 255, 255),
+        2,
+    )
+
+    if current_mode == "ZOOM":
+        y1 = int(h * ZOOM_TOP_LIMIT)
+        y2 = int(h * ZOOM_BOTTOM_LIMIT)
+
+        # Zone separators.
+        cv2.line(frame, (0, y1), (w, y1), (255, 0, 255), 2)
+        cv2.line(frame, (0, y2), (w, y2), (255, 0, 255), 2)
+
+        cv2.putText(
+            frame, zoom_zone_name,
+            (w - 190, 28),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.50,
+            (255, 0, 255), 2
+        )
+        cv2.putText(
+            frame, "ZOOM IN",
+            (w - 125, 28),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.50,
+            (255, 0, 255), 2
+        )
+        cv2.putText(
+            frame, "CENTER / STOP",
+            (w - 180, int(h * 0.50)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.48,
+            (255, 255, 255), 1
+        )
+        cv2.putText(
+            frame, "OK SIGN = ZOOM MODE",
+            (10, int(h * 0.50) - 28),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+            (255, 0, 255), 1
+        )
+        cv2.putText(
+            frame, "ZOOM OUT",
+            (w - 135, h - 12),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.50,
+            (255, 0, 255), 2
+        )
+
+        cv2.putText(
+            frame, zoom_zone_name,
+            (10, h - 42),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+            (255, 0, 255), 2
+        )
+
+    if is_paused:
+        cv2.putText(frame, "PAUSED", (w - 130, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+    elif is_fist:
+        cv2.putText(
+            frame, "",
+            (10, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+            (0, 255, 255), 2
+        )
+
+    cv2.imshow("Virtual Mouse - Stable / Low Jitter", frame)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key in [ord("q"), ord("Q")]:
+        break
+
+try:
+    _native_key(VK_CONTROL, True)
+    _native_key(VK_SHIFT, True)
+except Exception:
+    pass
+try:
+    status_ui.destroy()
+except Exception:
+    pass
+cap.release()
+detector.close()
+cv2.destroyAllWindows()
